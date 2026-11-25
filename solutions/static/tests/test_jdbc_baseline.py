@@ -1,5 +1,6 @@
 """Integration fixture for the two INSERT shapes, pending the production domains."""
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -46,15 +47,17 @@ def prepare(pc, state, receiver, args):
     assert isinstance(sql, StringValue)
     queries = sql.possible_strings()
     assert queries is not None  # Both fixture queries are literals.
-    yield CallResult(state, frozenset(query.count("?") for query in queries))
+    heap, ref = state.memory.allocate(pc, frozenset(query.count("?") for query in queries))
+    yield CallResult(replace(state, memory=heap), ref)
 
 
 def bind(pc, state, receiver, args):
     indices, _ = args
-    if any(index > count for count in receiver for index in indices):
+    counts = state.memory.read(receiver)
+    if any(index > count for count in counts for index in indices):
         yield Finding(pc, "invalid-parameter-index", "Setter index exceeds query arity")
         yield "sql error"
-    if any(index <= count for count in receiver for index in indices):
+    if any(index <= count for count in counts for index in indices):
         yield CallResult(state)
 
 

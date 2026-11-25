@@ -12,12 +12,60 @@ from jpamb import jvm
 from jvm.state import PC, StackInt
 
 
+type ObjectRef = frozenset[PC]
+
+
+@dataclass(frozen=True)
+class Heap:
+    """Persistent allocation-site map. Payloads provide their own join (|)."""
+    _objects: dict = field(default_factory=dict)
+    _repeated: frozenset[PC] = frozenset()
+
+    def allocate(self, site: PC, initial):
+        objects = self._objects.copy()
+        repeated = self._repeated
+        if site in objects:
+            # One site now represents potentially distinct live objects.
+            initial = objects[site] | initial
+            repeated = repeated | {site}
+        objects[site] = initial
+        return Heap(objects, repeated), frozenset({site})
+
+    def read(self, ref: ObjectRef):
+        sites = iter(ref)
+        if not ref:
+            raise ValueError("Cannot read an empty object reference")
+        value = self._objects[next(sites)]
+        for site in sites:
+            value = value | self._objects[site]
+        return value
+
+    def write(self, ref: ObjectRef, value):
+        if not ref:
+            raise ValueError("Cannot write an empty object reference")
+        objects = self._objects.copy()
+        for site in ref:
+            old = objects[site]
+            objects[site] = value if len(ref) == 1 and site not in self._repeated else old | value
+        return Heap(objects, self._repeated)
+
+    def __or__(self, other):
+        objects = self._objects.copy()
+        for site, value in other._objects.items():
+            objects[site] = objects[site] | value if site in objects else value
+        return Heap(objects, self._repeated | other._repeated)
+
+    def __sexpr__(self):
+        return [[site.encode(), sexpr.sexpr(value), site in self._repeated]
+                for site, value in sorted(self._objects.items(), key=lambda item: item[0].encode())]
+
+
 @dataclass(frozen=True)
 class State(sexpr.AsSExpr):
     locals: tuple[Lattice, ...]
     stack: tuple[Lattice, ...]
 
-    memory: Lattice | None = None
+    memory: Heap | Lattice | None = field(default_factory=Heap)
     # A guard can refine the local or array length that produced a stack value.
     origins: tuple[int | LengthOrigin | None, ...] = ()
     arrays: tuple[IntArray, ...] = ()
@@ -305,7 +353,7 @@ def initialstate(
             arrays.append(domain.array_input(value))
         else:
             locals[i] = domain.parameter(typ, value)
-    state = State(tuple(locals), (), memory, arrays=tuple(arrays))
+    state = State(tuple(locals), (), Heap() if memory is None else memory, arrays=tuple(arrays))
     return {PC(methodid, 0): state}
 
 

@@ -38,3 +38,19 @@ def test_static_zero_argument_return_preserves_stack():
     assert list(dispatch_call(pc, op, state, {("example/Factory", "create", "()I"): stub})) == [
         (pc + 1, state.push(value))
     ]
+
+
+def test_heap_aliases_and_summary_updates():
+    from static import Heap
+    method = jvm.AbsMethodID.decode("example.Factory.create:()I")
+    first, second = PC(method, 0), PC(method, 1)
+    heap, a = Heap().allocate(first, frozenset({1}))
+    heap, b = heap.allocate(second, frozenset({2}))
+    updated = heap.write(a, frozenset({3}))
+    assert updated.read(a) == {3} and updated.read(b) == {2}
+    assert (heap | updated).read(a) == {1, 3}
+    uncertain = updated.write(a | b, frozenset({4}))
+    assert uncertain.read(a) == {3, 4} and uncertain.read(b) == {2, 4}
+    again, alias = updated.allocate(first, frozenset({5}))
+    assert alias == a
+    assert again.write(alias, frozenset({6})).read(a) == {3, 5, 6}
