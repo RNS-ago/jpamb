@@ -1,10 +1,10 @@
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
-
+from operator import or_
 from typing import Protocol, runtime_checkable
 
-from abstractions import Lattice, SignSet
+from abstractions import ArrayRef, IntArray, Lattice, LengthOrigin, SignSet
 
 import jpamb
 import sexpr
@@ -18,15 +18,24 @@ class State(sexpr.AsSExpr):
     stack: tuple[Lattice, ...]
 
     memory: Lattice | None = None
+    # A guard can refine the local or array length that produced a stack value.
+    origins: tuple[int | LengthOrigin | None, ...] = ()
+    arrays: tuple[IntArray, ...] = ()
 
     def __post_init__(self):
         assert isinstance(self.locals, tuple)
         assert isinstance(self.stack, tuple)
+        if self.stack and not self.origins:
+            object.__setattr__(self, "origins", (None,) * len(self.stack))
+        assert len(self.stack) == len(self.origins)
 
     def __str__(self):
         return f"{', '.join(map(str, self.locals))}/{':'.join(map(str, self.stack))}"
 
     def __or__(self, other):
+        return self.merge(other, or_)
+
+    def merge(self, other, join_value):
         assert isinstance(other, State), f"Expected State but got {other!r}"
         assert len(self.stack) == len(other.stack), "Stack heights must match"
         assert len(self.locals) == len(other.locals), "Local counts must match"
@@ -35,25 +44,46 @@ class State(sexpr.AsSExpr):
             raise ValueError("Joined states must use the same memory domain")
 
         return State(
-            tuple(s1 | s2 for s1, s2 in zip(self.locals, other.locals)),
-            tuple(s1 | s2 for s1, s2 in zip(self.stack, other.stack)),
+            tuple(join_value(s1, s2) for s1, s2 in zip(self.locals, other.locals)),
+            tuple(join_value(s1, s2) for s1, s2 in zip(self.stack, other.stack)),
             self.memory | other.memory if self.memory is not None else other.memory,
+            tuple(a if a == b else None for a, b in zip(self.origins, other.origins)),
+            tuple(a.merge(b, join_value) for a, b in zip(self.arrays, other.arrays, strict=True)),
         )
 
-    def push(self, value: Lattice):
-        return replace(self, stack=self.stack + (value,))
+    def push(self, value: Lattice, origin: int | LengthOrigin | None = None):
+        return replace(self, stack=self.stack + (value,), origins=self.origins + (origin,))
 
     def pop(self, number=1):
         if not 0 <= number <= len(self.stack):
             raise ValueError("Operand stack underflow")
         split = len(self.stack) - number
-        return self.stack[split:], replace(self, stack=self.stack[:split])
+        return self.stack[split:], replace(self, stack=self.stack[:split], origins=self.origins[:split])
 
     def load(self, index):
         return self.locals[index]
 
     def store(self, index, value):
-        return replace(self, locals=self.locals[:index] + (value,) + self.locals[index + 1:])
+        origins = tuple(None if source == index else source for source in self.origins)
+        return replace(self, locals=self.locals[:index] + (value,) + self.locals[index + 1:], origins=origins)
+
+    def with_array(self, site, array):
+        return replace(self, arrays=self.arrays[:site] + (array,) + self.arrays[site + 1:])
+
+    def narrow(self, index, value):
+        if index is None:
+            return self
+        if isinstance(index, LengthOrigin):
+            site = index.site
+            array = self.arrays[site]
+            narrowed = array.length & value
+            state = self.with_array(site, replace(array, length=narrowed))
+            stack = tuple(narrowed if source == index else old for old, source in zip(self.stack, self.origins))
+            return replace(state, stack=stack)
+        narrowed = self.locals[index] & value
+        locals_ = self.locals[:index] + (narrowed,) + self.locals[index + 1:]
+        stack = tuple(narrowed if source == index else old for old, source in zip(self.stack, self.origins))
+        return replace(self, locals=locals_, stack=stack)
 
 
 @dataclass(frozen=True)
@@ -95,16 +125,26 @@ class SignDomain:
             yield value
 
     @staticmethod
+    def branch_values(left, right, op):
+        """Project feasible sign pairs back onto each operand for each edge."""
+        accepted = {
+            jvm.CmpOpr.Eq: {0}, jvm.CmpOpr.Ne: {-1, 1}, jvm.CmpOpr.Lt: {-1},
+            jvm.CmpOpr.Le: {-1, 0}, jvm.CmpOpr.Gt: {1}, jvm.CmpOpr.Ge: {0, 1},
+        }[op]
+        pairs = {True: [], False: []}
+        for a in left.signs:
+            for b in right.signs:
+                # Two positives (or two negatives) can occur in any order.
+                orders = {-1, 0, 1} if a == b != 0 else {(a > b) - (a < b)}
+                for taken in {order in accepted for order in orders}:
+                    pairs[taken].append((a, b))
+        for taken, feasible in pairs.items():
+            if feasible:
+                yield taken, SignSet(frozenset(a for a, _ in feasible)), SignSet(frozenset(b for _, b in feasible))
+
+    @staticmethod
     def compare(left, right, op):
-        if op in (jvm.CmpOpr.Eq, jvm.CmpOpr.Ne):
-            for a in left.signs:
-                for b in right.signs:
-                    if a == b:
-                        yield op == jvm.CmpOpr.Eq
-                    if a != b or a != 0:
-                        yield op == jvm.CmpOpr.Ne
-            return
-        yield from left.compare(right, op)
+        return (taken for taken, _, _ in SignDomain.branch_values(left, right, op))
 
     @staticmethod
     def literal(typ, value):
@@ -174,6 +214,11 @@ def successors(
             yield from dispatch_call(pc, opr, state, stubs or {})
         case jvm.Push(type=typ, value=value):
             yield pc + 1, state.push(domain.literal(typ, value))
+        case jvm.ArrayLength() | jvm.ArrayLoad(type=jvm.Int()) | jvm.ArrayStore(type=jvm.Int()):
+            handler = getattr(domain, "array_access", None)
+            if handler is None:
+                raise NotImplementedError(f"Unsupported array instruction at {pc}")
+            yield from handler(pc, state, opr)
         case jvm.Store(index=i):
             (value,), after = state.pop()
             yield pc + 1, after.store(i, value)
@@ -181,14 +226,26 @@ def successors(
             _, after = state.pop()
             yield pc + 1, after
         case jvm.Dup(words=1):
-            yield pc + 1, state.push(state.stack[-1])
+            yield pc + 1, state.push(state.stack[-1], state.origins[-1])
         case jvm.Incr(index=i, amount=amount):
             for res in domain.arithmetic(state.load(i), domain.literal(jvm.Int(), amount), jvm.BinaryOpr.Add):
                 yield res if isinstance(res, str) else (pc + 1, state.store(i, res))
-        case jvm.If(condition=op, target=target):
-            (left, right), after = state.pop(2)
-            for res in domain.compare(left, right, op):
-                yield res if isinstance(res, str) else (pc % target if res else pc + 1, after)
+        case jvm.If(condition=op, target=target) | jvm.Ifz(condition=op, target=target):
+            if isinstance(opr, jvm.Ifz):
+                (left,), after = state.pop()
+                right = domain.literal(jvm.Int(), 0)
+                origins = (state.origins[-1], None)
+            else:
+                (left, right), after = state.pop(2)
+                origins = state.origins[-2:]
+            refine = getattr(domain, "branch_values", None)
+            if refine is None:
+                for taken in domain.compare(left, right, op):
+                    yield taken if isinstance(taken, str) else (pc % target if taken else pc + 1, after)
+            else:
+                for taken, lhs, rhs in refine(left, right, op):
+                    edge = after.narrow(origins[0], lhs).narrow(origins[1], rhs)
+                    yield (pc % target if taken else pc + 1), edge
         case jvm.Get(static=True, field=field):
             # Hack - Only handle the assertion case
             assert field.extension.name == "$assertionsDisabled"
@@ -198,21 +255,9 @@ def successors(
 
             yield (pc + 1, state.push(va))
 
-        case jvm.Ifz(condition=op, target=target):
-            [val], after = state.pop(1)
-
-            for res in domain.compare(val, domain.literal(jvm.Int(), 0), op):
-                match res:
-                    case True:
-                        yield (pc % target, after)
-                    case False:
-                        yield (pc + 1, after)
-                    case err:
-                        yield err
-
         case jvm.Load(index=i):
             va = state.load(i)
-            yield (pc + 1, state.push(va))
+            yield (pc + 1, state.push(va, i))
 
         case jvm.Goto(target=t):
             yield (pc % t, state)
@@ -249,10 +294,18 @@ def initialstate(
 ) -> dict[PC, State]:
     method = bc.getmethod(methodid)
     locals = [domain.bottom()] * method.max_locals
+    arrays = []
     for i, typ in enumerate(methodid.extension.params):
         value = None if inputs is None else inputs.values[i]
-        locals[i] = domain.parameter(typ, value)
-    state = State(tuple(locals), (), memory)
+        if isinstance(typ, jvm.Array) and isinstance(typ.contains, jvm.Int) and hasattr(domain, "array_input"):
+            site = len(arrays)
+            # Unknown arguments can alias earlier arrays of the same type.
+            sites = range(site + 1) if value is None else (site,)
+            locals[i] = ArrayRef(frozenset(sites), nullable=value is None)
+            arrays.append(domain.array_input(value))
+        else:
+            locals[i] = domain.parameter(typ, value)
+    state = State(tuple(locals), (), memory, arrays=tuple(arrays))
     return {PC(methodid, 0): state}
 
 
@@ -290,6 +343,9 @@ class AbstractInterpreter:
                 before = self.states.get(pc_, None)
                 if before is None:
                     after = st
+                elif pc_.offset <= pc.offset and hasattr(self.domain, "widen"):
+                    # Widen on backward edges; ordinary branch joins keep their precision.
+                    after = before.merge(st, self.domain.widen)
                 else:
                     after = before | st
                 if before is None or after != before:
@@ -326,8 +382,14 @@ def interpret():
 
 
 def analyse():
-    """The static analysis"""
+    _analyse(use_intervals=False)
 
+
+def analyse_intervals():
+    _analyse(use_intervals=True)
+
+
+def _analyse(use_intervals):
     methodid = jpamb.getmethodid(
         "static",
         "1.0",
@@ -342,7 +404,12 @@ def analyse():
     steps = 300
 
     final = set()
-    ai = AbstractInterpreter.initial(bc, methodid, None)
+    domain = SignDomain
+    if use_intervals:
+        from interval_domain import IntervalDomain
+        from jdbc_scan import scan
+        domain = IntervalDomain(scan(bc.getmethod(methodid), budget=0).constants)
+    ai = AbstractInterpreter.initial(bc, methodid, None, domain=domain)
     while steps > 0 and ai.worklist:
         _, outcomes = ai.step()
         final.update(outcomes)

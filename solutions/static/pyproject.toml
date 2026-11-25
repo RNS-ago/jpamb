@@ -16,7 +16,9 @@ dependencies = [
 
 [project.scripts]
 static-interpreter = "static:interpret"
+static-interval-analysis = "static:analyse_intervals"
 static-analysis = "static:analyse"
+jdbc-scan = "jdbc_scan:main"
 
 [tool.uv.sources]
 jpamb = { path = "../../", editable = true }
