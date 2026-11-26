@@ -395,7 +395,7 @@ class AbstractInterpreter:
                     # Widen on backward edges; ordinary branch joins keep their precision.
                     after = before.merge(st, self.domain.widen)
                 else:
-                    after = before | st
+                    after = before.merge(st, getattr(self.domain, "join", or_))
                 if before is None or after != before:
                     self.states[pc_] = after
                     self.worklist.append(pc_)
@@ -452,12 +452,13 @@ def _analyse(use_intervals):
     steps = 300
 
     final = set()
-    domain = SignDomain
+    domain, stubs = SignDomain, {}
     if use_intervals:
-        from interval_domain import IntervalDomain
+        from combined import STRING_STUBS, CombinedDomain
         from jdbc_scan import scan
-        domain = IntervalDomain(scan(bc.getmethod(methodid), budget=0).constants)
-    ai = AbstractInterpreter.initial(bc, methodid, None, domain=domain)
+        domain = CombinedDomain(scan(bc.getmethod(methodid), budget=0).constants)
+        stubs = STRING_STUBS
+    ai = AbstractInterpreter.initial(bc, methodid, None, domain=domain, stubs=stubs)
     while steps > 0 and ai.worklist:
         _, outcomes = ai.step()
         final.update(outcomes)
