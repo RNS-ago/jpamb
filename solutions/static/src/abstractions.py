@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from operator import or_
 from typing import Literal, Self
 
 import jvm
@@ -197,6 +198,16 @@ class SignSet(Abstraction, Lattice):
         self, other: "SignSet", opr: jvm.BinaryOpr
     ) -> tuple["SignSet", set[str]]:
         match opr:
+            case jvm.BinaryOpr.Div:
+                signs = set()
+                for numerator in self.signs:
+                    for divisor in other.signs - {0}:
+                        signs.add(0)  # Integer division can truncate to zero.
+                        signs.add(numerator * divisor)
+                        if numerator == divisor == -1:
+                            signs.add(-1)  # JVM MIN_VALUE / -1 overflows.
+                errors = {"divide by zero"} if self.signs and 0 in other.signs else set()
+                return SignSet(frozenset(signs)), errors
             case jvm.BinaryOpr.Add:
                 output = set()
                 if 1 in self.signs:
@@ -234,41 +245,162 @@ class SignSet(Abstraction, Lattice):
                 raise NotImplementedError(f"TODO: {opr}")
 
 
-from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import Self
+INT_MIN = -(2**31)
+INT_MAX = 2**31 - 1
 
 
 @dataclass(frozen=True)
 class Interval(Abstraction, Lattice):
-    min: int | None
-    max: int | None
+    """Closed signed JVM int interval; [1,0] is the empty interval."""
+    min: int
+    max: int
 
-    def __str__(self):
-        return f"{self.min if self.min is not None else '-inf'}:{self.max if self.max is not None else 'inf'}"
+    def __post_init__(self):
+        if self.min > self.max:
+            object.__setattr__(self, "min", 1)
+            object.__setattr__(self, "max", 0)
+        elif self.min < INT_MIN or self.max > INT_MAX:
+            raise ValueError("Interval endpoint outside JVM int range")
+
+    @property
+    def empty(self):
+        return self.min > self.max
+
+    @classmethod
+    def bot(cls):
+        return cls(1, 0)
+
+    @classmethod
+    def top(cls):
+        return cls(INT_MIN, INT_MAX)
+
+    @classmethod
+    def exact(cls, value):
+        return cls(value, value)
+
+    @classmethod
+    def abstract(cls, values):
+        result = cls.bot()
+        for value in values:
+            if not isinstance(value, jvms.StackInt):
+                raise TypeError(value)
+            result |= cls.exact(value.value)
+        return result
+
+    def __contains__(self, value):
+        return isinstance(value, jvms.StackInt) and self.may_equal(value.value)
+
+    def may_equal(self, value):
+        return self.min <= value <= self.max
+
+    def may_be_outside(self, low, high):
+        return not self.empty and (self.min < low or self.max > high)
+
+    def __or__(self, other):
+        if self.empty:
+            return other
+        if other.empty:
+            return self
+        return Interval(min(self.min, other.min), max(self.max, other.max))
+
+    def __and__(self, other):
+        return Interval(max(self.min, other.min), min(self.max, other.max))
+
+    def __lt__(self, other):
+        return self != other and (self.empty or other.min <= self.min <= self.max <= other.max)
+
+    def __gt__(self, other):
+        return other < self
 
     def __sexpr__(self):
-        return str(self)
+        return "bottom" if self.empty else f"[{self.min},{self.max}]"
+
+    def widen(self, incoming, thresholds):
+        if self.empty or incoming.empty:
+            return self | incoming
+        lo, hi = self.min, self.max
+        if incoming.min < lo:
+            lo = max((k for k in thresholds if k <= incoming.min), default=INT_MIN)
+        if incoming.max > hi:
+            hi = min((k for k in thresholds if k >= incoming.max), default=INT_MAX)
+        return Interval(lo, hi)
 
     @classmethod
-    def abstract(cls, values: Iterable[jvms.StackValue]) -> Self:
-        raise NotImplementedError("TODO")
+    def wrapped_range(cls, lo, hi):
+        # Wrap precisely when the entire range lies in one signed 32-bit cycle.
+        width = 2**32
+        cycle = (lo - INT_MIN) // width
+        if cycle != (hi - INT_MIN) // width:
+            return cls.top()
+        return cls(lo - cycle * width, hi - cycle * width)
 
-    def __contains__(self, value: jvms.StackValue) -> bool:
-        raise NotImplementedError("TODO")
+
+@dataclass(frozen=True)
+class ArrayRef:
+    sites: frozenset[int]
+    nullable: bool
+
+    def __or__(self, other):
+        if isinstance(other, Interval) and other.empty:
+            return self
+        return ArrayRef(self.sites | other.sites, self.nullable or other.nullable)
+
+    def __and__(self, other):
+        return ArrayRef(self.sites & other.sites, self.nullable and other.nullable)
+
+
+@dataclass(frozen=True)
+class LengthOrigin:
+    site: int
+
+
+@dataclass(frozen=True)
+class IntArray:
+    """Length, tracked prefix cells, and a summary interval for remaining cells."""
+
+    PREFIX_LIMIT = 32
+
+    length: Interval
+    cells: tuple[Interval, ...]
+    default: Interval
 
     @classmethod
-    def top(cls) -> Self:
-        raise NotImplementedError("TODO")
+    def input(cls, value):
+        if value is None:
+            return cls(Interval(0, INT_MAX), (), Interval.top())
+        # Keep a bounded prefix exact, and summarise all remaining cells.
+        cells = tuple(Interval.exact(x) for x in value.values[:cls.PREFIX_LIMIT])
+        default = Interval.bot()
+        for x in value.values[cls.PREFIX_LIMIT:]:
+            default |= Interval.exact(x)
+        return cls(Interval.exact(len(value.values)), cells, default)
 
-    def __or__(self, other: "Interval") -> "Interval":
-        raise NotImplementedError("TODO")
+    def read(self, valid):
+        result = self.default if valid.max >= len(self.cells) else Interval.bot()
+        for cell in self.cells[valid.min:valid.max + 1]:
+            result |= cell
+        return result
 
-    def __and__(self, other: "Interval") -> "Interval":
-        raise NotImplementedError("TODO")
+    def write(self, valid, value):
+        """Return the updated object on the successful (in-bounds) edge."""
+        end = min(valid.max + 1, self.PREFIX_LIMIT)
+        cells = list(self.cells)
+        cells.extend([self.default] * max(0, end - len(cells)))
+        for i in range(valid.min, end):
+            cells[i] = value if valid.min == valid.max else cells[i] | value
+        default = self.default
+        if valid.max >= self.PREFIX_LIMIT:
+            # Updating one possible tail element preserves the other tail values.
+            default |= value
+        return replace(self, cells=tuple(cells), default=default)
 
-    def __lt__(self, other: "Interval") -> bool:
-        raise NotImplementedError("TODO")
+    def merge(self, other, join_value):
+        size = max(len(self.cells), len(other.cells))
+        left = self.cells + (self.default,) * (size - len(self.cells))
+        right = other.cells + (other.default,) * (size - len(other.cells))
+        return IntArray(join_value(self.length, other.length),
+                        tuple(join_value(a, b) for a, b in zip(left, right)),
+                        join_value(self.default, other.default))
 
-    def __gt__(self, other: "Interval") -> bool:
-        raise NotImplementedError("TODO")
+    def __or__(self, other):
+        return self.merge(other, or_)
