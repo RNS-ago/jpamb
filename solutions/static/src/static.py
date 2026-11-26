@@ -455,9 +455,10 @@ def _analyse(use_intervals):
     domain, stubs = SignDomain, {}
     if use_intervals:
         from combined import STRING_STUBS, CombinedDomain
+        from jdbc_stubs import JDBC_STUBS
         from jdbc_scan import scan
         domain = CombinedDomain(scan(bc.getmethod(methodid), budget=0).constants)
-        stubs = STRING_STUBS
+        stubs = STRING_STUBS | JDBC_STUBS
     ai = AbstractInterpreter.initial(bc, methodid, None, domain=domain, stubs=stubs)
     while steps > 0 and ai.worklist:
         _, outcomes = ai.step()
