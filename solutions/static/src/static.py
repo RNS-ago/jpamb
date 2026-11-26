@@ -69,6 +69,8 @@ class State(sexpr.AsSExpr):
     # A guard can refine the local or array length that produced a stack value.
     origins: tuple[int | LengthOrigin | None, ...] = ()
     arrays: tuple[IntArray, ...] = ()
+    # (local, array site) pairs where the local is known to be below that array's length.
+    below: frozenset[tuple[int, int]] = frozenset()
 
     def __post_init__(self):
         assert isinstance(self.locals, tuple)
@@ -97,6 +99,7 @@ class State(sexpr.AsSExpr):
             self.memory | other.memory if self.memory is not None else other.memory,
             tuple(a if a == b else None for a, b in zip(self.origins, other.origins)),
             tuple(a.merge(b, join_value) for a, b in zip(self.arrays, other.arrays, strict=True)),
+            self.below & other.below,
         )
 
     def push(self, value: Lattice, origin: int | LengthOrigin | None = None):
@@ -113,7 +116,8 @@ class State(sexpr.AsSExpr):
 
     def store(self, index, value):
         origins = tuple(None if source == index else source for source in self.origins)
-        return replace(self, locals=self.locals[:index] + (value,) + self.locals[index + 1:], origins=origins)
+        below = frozenset(fact for fact in self.below if fact[0] != index)
+        return replace(self, locals=self.locals[:index] + (value,) + self.locals[index + 1:], origins=origins, below=below)
 
     def with_array(self, site, array):
         return replace(self, arrays=self.arrays[:site] + (array,) + self.arrays[site + 1:])
@@ -249,6 +253,20 @@ def dispatch_call(pc, op, state, stubs: Mapping[StubKey, Stub]):
         yield pc + 1, successor
 
 
+NEGATED = {"Eq": jvm.CmpOpr.Ne, "Ne": jvm.CmpOpr.Eq, "Lt": jvm.CmpOpr.Ge,
+           "Ge": jvm.CmpOpr.Lt, "Gt": jvm.CmpOpr.Le, "Le": jvm.CmpOpr.Gt}
+
+
+def record_below(state, origins, holds):
+    """Remember local < a.length after a guard like i < a.length or a.length > i."""
+    left, right = origins
+    if holds.name == "Lt" and isinstance(left, int) and isinstance(right, LengthOrigin):
+        return replace(state, below=state.below | {(left, right.site)})
+    if holds.name == "Gt" and isinstance(left, LengthOrigin) and isinstance(right, int):
+        return replace(state, below=state.below | {(right, left.site)})
+    return state
+
+
 def successors(
     bc: jpamb.Bytecode,
     pc: PC,
@@ -293,6 +311,7 @@ def successors(
             else:
                 for taken, lhs, rhs in refine(left, right, op):
                     edge = after.narrow(origins[0], lhs).narrow(origins[1], rhs)
+                    edge = record_below(edge, origins, op if taken else NEGATED[op.name])
                     yield (pc % target if taken else pc + 1), edge
         case jvm.Get(static=True, field=field):
             # Hack - Only handle the assertion case
@@ -349,7 +368,8 @@ def initialstate(
             site = len(arrays)
             # Unknown arguments can alias earlier arrays of the same type.
             sites = range(site + 1) if value is None else (site,)
-            locals[i] = ArrayRef(frozenset(sites), nullable=value is None)
+            # JPAMB inputs cannot express null.
+            locals[i] = ArrayRef(frozenset(sites), nullable=False)
             arrays.append(domain.array_input(value))
         else:
             locals[i] = domain.parameter(typ, value)

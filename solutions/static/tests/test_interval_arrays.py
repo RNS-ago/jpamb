@@ -19,8 +19,8 @@ def test_first_guard_and_read_in_proposal_loop():
     # Start at the first length read, after fixture setup and i = 0.
     initial = engine.states[jvm.state.PC(mid, 0)].store(3, Interval.exact(0))
     state = initial.push(initial.load(3), 3).push(initial.load(0), 0)
-    null, (guard, state) = successors(bc, length_pc, state, domain)
-    assert null == "null pointer"
+    # JPAMB inputs are never null, so reading the length cannot fail.
+    (guard, state), = successors(bc, length_pc, state, domain)
     assert state.locals[0] == ArrayRef(frozenset({0}), False)
     branches = dict(successors(bc, guard, state, domain))
     assert branches[guard % bc[guard].target].arrays[0].length == Interval.exact(0)
@@ -30,7 +30,7 @@ def test_first_guard_and_read_in_proposal_loop():
     (next_pc, result), = successors(bc, read_pc, before_read, domain)
     assert next_pc == read_pc + 1 and result.stack == (Interval.top(),)
 
-    _, out_of_bounds, (_, _) = successors(
+    out_of_bounds, (_, _) = successors(
         bc, read_pc, initial.push(initial.load(0), 0).push(Interval.exact(0)), domain
     )
     assert out_of_bounds == "out of bounds"

@@ -52,7 +52,8 @@ def test_builder_in_loop_terminates_and_is_sound():
     queries = []
     outcomes = run("jpamb.cases.Jdbc.orQuery:([I)V", fake_jdbc(queries))
     assert "SELECT COUNT(*) FROM users WHERE id = ? OR id = ?" in queries[-1]
-    assert "assertion error" in outcomes
+    # ids[i] sits under the guard i < ids.length, and inputs are never null.
+    assert outcomes == {"ok", "assertion error"}
 
 
 def test_string_input_is_tainted():

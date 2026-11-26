@@ -115,7 +115,8 @@ class IntervalDomain:
                 continue
 
             index = operands[1]
-            if index.may_be_outside(0, array.length.min - 1):
+            known_below = (state.origins[1-count], site) in state.below and index.min >= 0
+            if not known_below and index.may_be_outside(0, array.length.min - 1):
                 yield "out of bounds"
             valid = index & Interval(0, array.length.max - 1)
             if valid.empty:
