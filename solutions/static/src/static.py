@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from operator import or_
 from typing import Protocol, runtime_checkable
 
-from abstractions import ArrayRef, IntArray, Lattice, LengthOrigin, SignSet
+from abstractions import INT_MAX, INT_MIN, ArrayRef, IntArray, Interval, Lattice, LengthOrigin, SignSet
 
 import jpamb
 import sexpr
@@ -457,7 +457,57 @@ def analyse_intervals():
     _analyse(use_intervals=True)
 
 
-def _analyse(use_intervals):
+def analyse_unpartitioned():
+    # Baseline for the evaluation: same analysis with every path merged.
+    _analyse(use_intervals=True, budget=0)
+
+
+# Partitions per method; selectColumnByChoice needs two (choice == 0, choice == 1).
+PARTITION_BUDGET = 2
+
+
+def regions(predicate):
+    """Input intervals that together cover every int, split at the predicate."""
+    c = predicate.constant
+    if predicate.operator == "==":
+        return [Interval.exact(c), Interval(INT_MIN, c - 1), Interval(c + 1, INT_MAX)]
+    cut = c if predicate.operator == "<" else c + 1
+    return [Interval(INT_MIN, cut - 1), Interval(cut, INT_MAX)]
+
+
+def partitions(selected):
+    """Map parameter index to interval, one map per combination of regions."""
+    parts = [{}]
+    for candidate in selected:
+        p = candidate.predicate.parameter
+        parts = [{**part, p: part.get(p, Interval.top()) & r}
+                 for part in parts for r in regions(candidate.predicate)]
+    return [part for part in parts if not any(r.empty for r in part.values())]
+
+
+def run_partitions(bc, methodid, domain, stubs, parts, steps=1000):
+    """Run once per input partition and union the results; incomplete if any run is."""
+    final, findings = set(), set()
+    for part in parts:
+        ai = AbstractInterpreter.initial(bc, methodid, None, domain=domain, stubs=stubs)
+        start = next(iter(ai.states))
+        state = ai.states[start]
+        for p, region in part.items():
+            state = state.narrow(p, region)
+        if any(state.locals[p].empty for p in part):
+            continue  # the region lies outside the parameter's type, e.g. 2 for a boolean
+        ai.states[start] = state
+        budget = steps
+        while budget > 0 and ai.worklist:
+            final.update(ai.step()[1])
+            budget -= 1
+        if ai.worklist:
+            return final, findings, True
+        findings |= ai.findings
+    return final, findings, False
+
+
+def _analyse(use_intervals, budget=PARTITION_BUDGET):
     methodid = jpamb.getmethodid(
         "static",
         "1.0",
@@ -469,26 +519,20 @@ def _analyse(use_intervals):
     suite, eff = jpamb.setup()
     bc = jpamb.Bytecode(suite, eff, {})
 
-    steps = 1000
-
-    final = set()
-    domain, stubs = SignDomain, {}
+    domain, stubs, parts = SignDomain, {}, [{}]
     if use_intervals:
         from combined import STRING_STUBS, CombinedDomain
         from jdbc_stubs import JDBC_STUBS
         from jdbc_scan import scan
-        domain = CombinedDomain(scan(bc.getmethod(methodid), budget=0).constants)
+        found = scan(bc.getmethod(methodid), budget=budget)
+        domain = CombinedDomain(found.constants)
         stubs = STRING_STUBS | JDBC_STUBS
+        parts = partitions(found.selected)
     try:
-        ai = AbstractInterpreter.initial(bc, methodid, None, domain=domain, stubs=stubs)
-        while steps > 0 and ai.worklist:
-            _, outcomes = ai.step()
-            final.update(outcomes)
-            steps -= 1
-        incomplete = bool(ai.worklist)
+        final, _, incomplete = run_partitions(bc, methodid, domain, stubs, parts)
     except NotImplementedError:
         # Unsupported instruction or call: give up soundly.
-        incomplete = True
+        final, incomplete = set(), True
 
     # Only a loop can run forever; the interpreter does not follow calls.
     code = bc.getmethod(methodid).opcodes

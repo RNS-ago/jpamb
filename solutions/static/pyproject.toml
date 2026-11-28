@@ -18,6 +18,7 @@ dependencies = [
 static-interpreter = "static:interpret"
 static-interval-analysis = "static:analyse_intervals"
 static-analysis = "static:analyse"
+static-unpartitioned-analysis = "static:analyse_unpartitioned"
 jdbc-scan = "jdbc_scan:main"
 
 [tool.uv.sources]
