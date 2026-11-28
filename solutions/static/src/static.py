@@ -469,7 +469,7 @@ def _analyse(use_intervals):
     suite, eff = jpamb.setup()
     bc = jpamb.Bytecode(suite, eff, {})
 
-    steps = 300
+    steps = 1000
 
     final = set()
     domain, stubs = SignDomain, {}
@@ -479,13 +479,29 @@ def _analyse(use_intervals):
         from jdbc_scan import scan
         domain = CombinedDomain(scan(bc.getmethod(methodid), budget=0).constants)
         stubs = STRING_STUBS | JDBC_STUBS
-    ai = AbstractInterpreter.initial(bc, methodid, None, domain=domain, stubs=stubs)
-    while steps > 0 and ai.worklist:
-        _, outcomes = ai.step()
-        final.update(outcomes)
-        steps -= 1
+    try:
+        ai = AbstractInterpreter.initial(bc, methodid, None, domain=domain, stubs=stubs)
+        while steps > 0 and ai.worklist:
+            _, outcomes = ai.step()
+            final.update(outcomes)
+            steps -= 1
+        incomplete = bool(ai.worklist)
+    except NotImplementedError:
+        # Unsupported instruction or call: give up soundly.
+        incomplete = True
 
-    incomplete = bool(ai.worklist)
+    # Only a loop can run forever; the interpreter does not follow calls.
+    code = bc.getmethod(methodid).opcodes
+    has_loop = any(getattr(op, "target", pc + 1) <= pc for pc, op in enumerate(code))
+
+    # Distinct names give each kind of guess its own calibrated wager.
     for outcome in jpamb.QUERIES:
-        answer = "maybe" if incomplete or outcome in final else "no"
+        if incomplete:
+            answer = "unknown"
+        elif outcome in final:
+            answer = "maybe"
+        elif outcome == "*" and has_loop:
+            answer = "loop"
+        else:
+            answer = "no"
         print(f"{outcome};{answer}")
