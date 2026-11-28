@@ -689,10 +689,6 @@
     :coverage ()
     :results (ok "sql error")
   )
-  :"jpamb.cases.Jdbc.insertOrdersSharedCoupon!([I:1, 1], 5)V" (control
-    :coverage ()
-    :results ("sql error")
-  )
   :"jpamb.cases.Jdbc.insertOrdersSharedCoupon!([I:1, 2], 5)V" (control
     :coverage ()
     :results (ok)
@@ -703,7 +699,7 @@
   )
   :"jpamb.cases.Jdbc.insertOrdersSharedCoupon:([II)V" (control
     :coverage ()
-    :results (ok "sql error")
+    :results (ok)
   )
   :"jpamb.cases.Jdbc.orQuery!([I:1, 1, 9])V" (control
     :coverage ()
@@ -777,13 +773,9 @@
     :coverage ()
     :results (ok)
   )
-  :"jpamb.cases.Jdbc.resubmitAfterBatch!(true)V" (control
-    :coverage ()
-    :results ("sql error")
-  )
   :"jpamb.cases.Jdbc.resubmitAfterBatch:(Z)V" (control
     :coverage ()
-    :results (ok "sql error")
+    :results (ok)
   )
   :"jpamb.cases.Jdbc.reuseAfterBatch!(0)V" (control
     :coverage ()

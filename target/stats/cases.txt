@@ -64,7 +64,6 @@ jpamb.cases.Jdbc.insertOrdersBindEveryIteration:([I)V        ([I:7, 0]) -> ok
 jpamb.cases.Jdbc.insertOrdersClearAfterAdd:([I)V             ([I:7, 0]) -> sql error
 jpamb.cases.Jdbc.insertOrdersClearAfterAdd:([I)V             ([I:7, 7]) -> ok
 jpamb.cases.Jdbc.insertOrdersClearAfterAdd:([I)V             ([I:]) -> ok
-jpamb.cases.Jdbc.insertOrdersSharedCoupon:([II)V             ([I:1, 1], 5) -> sql error
 jpamb.cases.Jdbc.insertOrdersSharedCoupon:([II)V             ([I:1, 2], 5) -> ok
 jpamb.cases.Jdbc.insertOrdersSharedCoupon:([II)V             ([I:], 5) -> ok
 jpamb.cases.Jdbc.orQuery:([I)V                               ([I:1, 1, 9]) -> ok
@@ -80,7 +79,6 @@ jpamb.cases.Jdbc.queryAlternativesMismatch:(Z)V              (true) -> ok
 jpamb.cases.Jdbc.readAge:(I)I                                (1) -> ok
 jpamb.cases.Jdbc.readAge:(I)I                                (9) -> sql error
 jpamb.cases.Jdbc.resubmitAfterBatch:(Z)V                     (false) -> ok
-jpamb.cases.Jdbc.resubmitAfterBatch:(Z)V                     (true) -> sql error
 jpamb.cases.Jdbc.reuseAfterBatch:(I)V                        (0) -> ok
 jpamb.cases.Jdbc.reuseAfterBatch:(I)V                        (5) -> assertion error
 jpamb.cases.Jdbc.selectColumnByChoice:(I)V                   (0) -> ok

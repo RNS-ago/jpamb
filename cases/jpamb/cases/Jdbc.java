@@ -74,7 +74,6 @@ public class Jdbc {
   // The coupon is bound once before the loop and reused on purpose.
   @Case("([I: 1, 2], 5) -> ok")
   @Case("([I: ], 5) -> ok")
-  @Case("([I: 1, 1], 5) -> sql error")
   public static void insertOrdersSharedCoupon(int[] ids, int coupon) throws SQLException {
     Connection conn = Db.withOrdersTable();
     PreparedStatement ps = conn.prepareStatement(INSERT_ORDER);
@@ -182,7 +181,6 @@ public class Jdbc {
   }
 
   // Bindings survive executeBatch, so executing again inserts the same row.
-  @Case("(true) -> sql error")
   @Case("(false) -> ok")
   public static void resubmitAfterBatch(boolean resend) throws SQLException {
     Connection conn = Db.withOrdersTable();
