@@ -7,6 +7,7 @@ from dataclasses import replace
 
 from abstractions import Interval
 from jdbc_domain import JDBCState, MAX_TRACKED_PARAMETERS
+from schema import columns_ok, numeric, parameter_types
 from static import CallResult, Finding
 
 
@@ -68,7 +69,30 @@ def prepare(pc, state, receiver, args):
         return
     if sql.tainted():
         yield Finding(pc, 'possible-sql-injection', 'SQL may contain user input')
+    # H2 rejects an unknown column when the statement is prepared.
+    texts = sql.possible_strings()
+    if texts is None or not all(columns_ok(t) for t in texts):
+        yield Finding(pc, 'unknown-column', 'SQL may name a column its table lacks')
+        yield 'sql error'
     yield _allocate(pc, state, jdbc)
+
+
+def _may_reject_text(jdbc, index, value):
+    """True when setString may put a non-number into an INT column (or we cannot tell)."""
+    texts = value.possible_strings()
+    if texts is not None and all(numeric(t) for t in texts):
+        return False
+    if jdbc.alternatives is None or index.empty or index.max - index.min > MAX_TRACKED_PARAMETERS:
+        return True
+    for statement in jdbc.alternatives:
+        if statement.query.text is None:
+            return True
+        types = parameter_types(statement.query.text)
+        for i in range(index.min, index.max + 1):
+            # Out-of-range indices are reported by the binding check itself.
+            if 1 <= i <= len(types) and types[i - 1] != 'VARCHAR':
+                return True
+    return False
 
 
 def _bind_interval(jdbc, index):
@@ -182,3 +206,14 @@ for name, desc, operation, kind in (
     JDBC_STUBS['java/sql/PreparedStatement', name, desc] = _operation(operation, kind)
     if name in {'executeBatch', 'clearBatch', 'close'}:
         JDBC_STUBS['java/sql/Statement', name, desc] = _operation(operation, kind)
+
+
+def set_string(pc, state, receiver, args, bind=_operation('bind')):
+    jdbc = state.memory.read(receiver)
+    if isinstance(jdbc, JDBCState) and _may_reject_text(jdbc, args[0], args[1]):
+        yield Finding(pc, 'text-in-int-column', 'setString may bind a non-number to an INT column')
+        yield 'sql error'
+    yield from bind(pc, state, receiver, args)
+
+
+JDBC_STUBS['java/sql/PreparedStatement', 'setString', '(ILjava/lang/String;)V'] = set_string
